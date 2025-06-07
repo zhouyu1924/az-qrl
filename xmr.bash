@@ -1,56 +1,85 @@
 #!/usr/bin/env bash
-# create-vms-ubuntu2404-all-regions.sh
-# ⚠️ 每个推荐区域都会创建 1 台 VM，务必先确认配额与预算！
+# create-vms-all-regions-simple-parallel.sh
+# 基于 single-vm-test.sh：在所有 Recommended 区域并发创建 Standard_B2s VM，并执行启动脚本
+# 无配额检测，失败自动跳过
 
-# ---------- 可按需修改的参数 ----------
-VM_SIZE="Standard_F8as_v6"
-IMAGE_URN="Canonical:ubuntu-24_04-lts:server:latest"   # Ubuntu 24.04 LTS
+# ======= 可调参数 ===============================================================
+VM_SIZE="Standard_B2s"                        # 2 vCPU / 4 GiB RAM
+IMAGE_URN="Canonical:ubuntu-24_04-lts:server:latest"
 ADMIN_USER="zhouyu"
-ADMIN_PASSWORD="20011123zmyZMY@"                       # 明文密码；生产环境请改用安全方案
-TAGS="purpose=multi-region-demo"
+ADMIN_PASSWORD="20011123zmyZMY@"              # 建议改用 Key Vault 或 SSH
 STARTUP_SCRIPT_URL="https://raw.githubusercontent.com/zhouyu1924/xmr/main/sxmr.bash"
+CONCURRENCY=6                                 # 并发线程数 (parallel -j / xargs -P)
+TAGS="purpose=mass-deploy-b2s"
+# ==============================================================================
 
-# ---------- 获取所有“推荐”区域 ----------
-echo "Fetching Azure regions..."
-locations=$(az account list-locations \
-  --query "[?metadata.regionCategory=='Recommended'].name" -o tsv)
+# ---------- 登录订阅（已登录可注释） ----------
+# az login
+# az account set --subscription "<your-subscription-id>"
 
-# ---------- 遍历区域并创建资源 ----------
-for location in $locations; do
-  rg="rg-$location"
-  vm="vm-$location"
+echo "🔍 获取 Recommended 区域列表..."
+REGIONS=$(az account list-locations \
+           --query "[?metadata.regionCategory=='Recommended'].name" -o tsv)
 
-  echo -e "\n=== $location ==="
+# ---------- 函数：创建并配置 VM ----------
+create_vm() {
+  local LOCATION="$1"
+  local RG="rg-$LOCATION"
+  local VM="vm-$LOCATION"
 
-  # 创建资源组
-  az group create \
-    --name "$rg" \
-    --location "$location" \
-    --tags "$TAGS" \
-    --output none
+  echo "🚀 [$LOCATION] 开始创建 VM..."
 
-  # 创建虚拟机（密码登录）
-  az vm create \
-    --name "$vm" \
-    --resource-group "$rg" \
-    --location "$location" \
-    --image "$IMAGE_URN" \
-    --size "$VM_SIZE" \
-    --admin-username "$ADMIN_USER" \
-    --authentication-type password \
-    --admin-password "$ADMIN_PASSWORD" \
-    --public-ip-sku Standard \
-    --tags "$TAGS" \
-    --no-wait
+  # 1. 资源组
+  if ! az group create -n "$RG" -l "$LOCATION" --tags "$TAGS" --output none 2>/dev/null; then
+    echo "❌ [$LOCATION] 创建资源组失败，跳过"
+    return
+  fi
 
-  # 配置启动脚本扩展（Custom Script Extension）
-  az vm extension set \
-    --publisher Microsoft.Azure.Extensions \
-    --name customScript \
-    --resource-group "$rg" \
-    --vm-name "$vm" \
-    --settings "{\"fileUris\": [\"$STARTUP_SCRIPT_URL\"], \"commandToExecute\": \"bash sxmr.bash && bash sxmr.bash\"}" \
-    --no-wait
-done
+  # 2. 创建 VM（同步等待）
+  if ! az vm create \
+        --name "$VM" \
+        --resource-group "$RG" \
+        --location "$LOCATION" \
+        --image "$IMAGE_URN" \
+        --size "$VM_SIZE" \
+        --admin-username "$ADMIN_USER" \
+        --authentication-type password \
+        --admin-password "$ADMIN_PASSWORD" \
+        --public-ip-sku Standard \
+        --tags "$TAGS" \
+        --only-show-errors \
+        --output none; then
+    echo "❌ [$LOCATION] VM 创建失败，跳过"
+    return
+  fi
 
-echo -e "\n所有创建请求已提交！可用 az vm list -d 查看状态。"
+  # 3. 安装 Custom Script 扩展
+  if ! az vm extension set \
+        --publisher Microsoft.Azure.Extensions \
+        --name customScript \
+        --resource-group "$RG" \
+        --vm-name "$VM" \
+        --settings "{\"fileUris\": [\"$STARTUP_SCRIPT_URL\"], \"commandToExecute\": \"bash sxmr.bash && bash sxmr.bash\"}" \
+        --only-show-errors \
+        --output none; then
+    echo "❌ [$LOCATION] 启动脚本扩展安装失败，跳过"
+    return
+  fi
+
+  echo "✅ [$LOCATION] 创建完成"
+}
+
+export -f create_vm
+export VM_SIZE IMAGE_URN ADMIN_USER ADMIN_PASSWORD STARTUP_SCRIPT_URL TAGS
+
+# ---------- 并发执行 ----------
+if command -v parallel >/dev/null 2>&1; then
+  echo "🔧 使用 GNU parallel 并发 $CONCURRENCY 个任务..."
+  echo "$REGIONS" | parallel -j "$CONCURRENCY" --no-notice create_vm {}
+else
+  echo "🔧 GNU parallel 未安装，使用 xargs -P$CONCURRENCY 并发..."
+  echo "$REGIONS" | xargs -n1 -P"$CONCURRENCY" -I{} bash -c 'create_vm "$@"' _ {}
+fi
+
+echo "🎉 批量创建提交完毕。可用：az vm list -d --tag $TAGS -o table 查看结果。"
+
